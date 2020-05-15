@@ -26,6 +26,7 @@ import torch.optim as optim
 from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
 import torchvision.transforms as transforms
+import torch.nn.functional as F
 
 
 dir_path = (os.path.abspath(os.path.join(os.path.realpath(__file__), './.')))
@@ -37,7 +38,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train a DAMSM network')
     parser.add_argument('--cfg', dest='cfg_file',
                         help='optional config file',
-                        default='cfg/DAMSM/bird.yml', type=str)
+                        default='cfg/bird.yml', type=str)
     parser.add_argument('--gpu', dest='gpu_id', type=int, default=0)
     parser.add_argument('--data_dir', dest='data_dir', type=str, default='')
     parser.add_argument('--manualSeed', type=int, help='manual seed')
@@ -45,14 +46,16 @@ def parse_args():
     return args
 
 
-def train(dataloader, cnn_model, rnn_model, batch_size,
-          labels, optimizer, epoch, ixtoword, image_dir):
+def train(dataloader, cnn_model, rnn_model, d_model, batch_size,
+          labels, generator_optimizer, discriminator_optimizer, epoch, ixtoword, image_dir):
     cnn_model.train()
     rnn_model.train()
     s_total_loss0 = 0
     s_total_loss1 = 0
     w_total_loss0 = 0
     w_total_loss1 = 0
+    d_total_loss = 0
+    g_total_loss = 0
     count = (epoch + 1) * len(dataloader)
     start_time = time.time()
     for step, data in enumerate(dataloader, 0):
@@ -60,9 +63,7 @@ def train(dataloader, cnn_model, rnn_model, batch_size,
         rnn_model.zero_grad()
         cnn_model.zero_grad()
 
-        imgs, captions, cap_lens, \
-            class_ids, keys = prepare_data(data)
-
+        imgs, captions, cap_lens, class_ids, keys = prepare_data(data)
 
         # words_features: batch_size x nef x 17 x 17
         # sent_code: batch_size x nef
@@ -76,25 +77,46 @@ def train(dataloader, cnn_model, rnn_model, batch_size,
         # sent_emb: batch_size x nef
         words_emb, sent_emb = rnn_model(captions, cap_lens, hidden)
 
-        w_loss0, w_loss1, attn_maps = words_loss(words_features, words_emb, labels,
-                                                 cap_lens, class_ids, batch_size)
+        w_loss0, w_loss1, attn_maps = words_loss(words_features, words_emb, labels, cap_lens, class_ids, batch_size)
         w_total_loss0 += w_loss0.data
         w_total_loss1 += w_loss1.data
         loss = w_loss0 + w_loss1
 
-        s_loss0, s_loss1 = \
-            sent_loss(sent_code, sent_emb, labels, class_ids, batch_size)
+        s_loss0, s_loss1 = sent_loss(sent_code, sent_emb, labels, class_ids, batch_size)
         loss += s_loss0 + s_loss1
         s_total_loss0 += s_loss0.data
         s_total_loss1 += s_loss1.data
-        #
+
+        is_fake_0, pred_class_0 = d_model(sent_code)
+        is_fake_1, pred_class_1 = d_model(sent_emb)
+        g_loss = (is_fake_0.mean() + is_fake_1.mean()
+                 + F.cross_entropy(pred_class_0, class_ids)
+                 + F.cross_entropy(pred_class_1, class_ids))
+        loss += g_loss
+        g_total_loss += g_loss.data
+
         loss.backward()
         #
         # `clip_grad_norm` helps prevent
         # the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm(rnn_model.parameters(),
                                       cfg.TRAIN.RNN_GRAD_CLIP)
-        optimizer.step()
+        generator_optimizer.step()
+        d_model.zero_grad()
+
+        _, sent_code = cnn_model(imgs[-1])
+        hidden = rnn_model.init_hidden(batch_size)
+        _, sent_emb = rnn_model(captions, cap_lens, hidden)
+
+        is_fake_0, pred_class_0 = d_model(sent_code)
+        is_fake_1, pred_class_1 = d_model(sent_emb)
+        d_loss = (is_fake_0.mean() - is_fake_1.mean()
+                + F.cross_entropy(pred_class_0, class_ids)
+                + F.cross_entropy(pred_class_1, class_ids))
+        loss = d_loss
+        loss.backward()
+        discriminator_optimizer.step()
+        d_total_loss += d_loss.data
 
         if step % UPDATE_INTERVAL == 0:
             count = epoch * len(dataloader) + step
@@ -105,18 +127,23 @@ def train(dataloader, cnn_model, rnn_model, batch_size,
             w_cur_loss0 = w_total_loss0[0] / UPDATE_INTERVAL
             w_cur_loss1 = w_total_loss1[0] / UPDATE_INTERVAL
 
+            d_cur_loss = d_cur_loss[0] / UPDATE_INTERVAL
+            g_cur_loss = g_cur_loss[0] / UPDATE_INTERVAL
+
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | '
                   's_loss {:5.2f} {:5.2f} | '
-                  'w_loss {:5.2f} {:5.2f}'
+                  'w_loss {:5.2f} {:5.2f} | d_loss {:5.2f} | g_loss {:5.2f}'
                   .format(epoch, step, len(dataloader),
                           elapsed * 1000. / UPDATE_INTERVAL,
                           s_cur_loss0, s_cur_loss1,
-                          w_cur_loss0, w_cur_loss1))
+                          w_cur_loss0, w_cur_loss1, d_cur_loss, g_cur_loss))
             s_total_loss0 = 0
             s_total_loss1 = 0
             w_total_loss0 = 0
             w_total_loss1 = 0
+            d_total_loss = 0
+            g_total_loss = 0
             start_time = time.time()
             # attention Maps
             img_set, _ = \
@@ -256,7 +283,7 @@ if __name__ == "__main__":
         shuffle=True, num_workers=int(cfg.WORKERS))
 
     # Train ##############################################################
-    text_encoder, image_encoder, labels, start_epoch = build_models()
+    text_encoder, image_encoder, discriminator, labels, start_epoch = build_models()
     para = list(text_encoder.parameters())
     for v in image_encoder.parameters():
         if v.requires_grad:
@@ -268,7 +295,7 @@ if __name__ == "__main__":
         for epoch in range(start_epoch, cfg.TRAIN.MAX_EPOCH):
             optimizer = optim.Adam(para, lr=lr, betas=(0.5, 0.999))
             epoch_start_time = time.time()
-            count = train(dataloader, image_encoder, text_encoder,
+            count = train(dataloader, image_encoder, text_encoder, discriminator,
                           batch_size, labels, optimizer, epoch,
                           dataset.ixtoword, image_dir)
             print('-' * 89)
@@ -288,6 +315,8 @@ if __name__ == "__main__":
                            '%s/image_encoder%d.pth' % (model_dir, epoch))
                 torch.save(text_encoder.state_dict(),
                            '%s/text_encoder%d.pth' % (model_dir, epoch))
+                torch.save(discriminator.state_dict(),
+                           '%s/discriminator%d.pth' % (model_dir, epoch))
                 print('Save G/Ds models.')
     except KeyboardInterrupt:
         print('-' * 89)

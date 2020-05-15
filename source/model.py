@@ -72,10 +72,13 @@ class ResBlock(nn.Module):
 
 
 # ############## Text2Image Encoder-Decoder #######
+
+
 class RNN_ENCODER(nn.Module):
     def __init__(self, ntoken, ninput=300, drop_prob=0.5,
                  nhidden=128, nlayers=1, bidirectional=True):
         super(RNN_ENCODER, self).__init__()
+        self.z_size = cfg.GAN.Z_DIM
         self.n_steps = cfg.TEXT.WORDS_NUM
         self.ntoken = ntoken  # size of the dictionary
         self.ninput = ninput  # size of each embedding vector
@@ -110,6 +113,7 @@ class RNN_ENCODER(nn.Module):
                               bidirectional=self.bidirectional)
         else:
             raise NotImplementedError
+        self.zsl_g = ZSL_G(cfg.GAN.Z_DIM, cfg.TEXT.EMBEDDING_DIM, cfg.GAN.CONDITION_DIM)
 
     def init_weights(self):
         initrange = 0.1
@@ -130,7 +134,7 @@ class RNN_ENCODER(nn.Module):
             return Variable(weight.new(self.nlayers * self.num_directions,
                                        bsz, self.nhidden).zero_())
 
-    def forward(self, captions, cap_lens, hidden, mask=None):
+    def forward(self, captions, cap_lens, hidden, mask=None, z=None):
         # input: torch.LongTensor of size batch x n_steps
         # --> emb: batch x n_steps x ninput
         emb = self.drop(self.encoder(captions))
@@ -156,7 +160,7 @@ class RNN_ENCODER(nn.Module):
         else:
             sent_emb = hidden.transpose(0, 1).contiguous()
         sent_emb = sent_emb.view(-1, self.nhidden * self.num_directions)
-        return words_emb, sent_emb
+        return words_emb, self.zsl_g(sent_emb, z)
 
 
 class CNN_ENCODER(nn.Module):
@@ -197,7 +201,7 @@ class CNN_ENCODER(nn.Module):
         self.Mixed_7c = model.Mixed_7c
 
         self.emb_features = conv1x1(768, self.nef)
-        self.emb_cnn_code = nn.Linear(2048, self.nef)
+        self.emb_cnn_code = nn.Sequential(nn.Linear(2048, self.nef), nn.Tanh())
 
     def init_trainable_weights(self):
         initrange = 0.1
@@ -268,42 +272,11 @@ class CNN_ENCODER(nn.Module):
 
 
 # ############## G networks ###################
-class CA_NET(nn.Module):
-    # some code is modified from vae examples
-    # (https://github.com/pytorch/examples/blob/master/vae/main.py)
-    def __init__(self):
-        super(CA_NET, self).__init__()
-        self.t_dim = cfg.TEXT.EMBEDDING_DIM
-        self.c_dim = cfg.GAN.CONDITION_DIM
-        self.fc = nn.Linear(self.t_dim, self.c_dim * 4, bias=True)
-        self.relu = GLU()
-
-    def encode(self, text_embedding):
-        x = self.relu(self.fc(text_embedding))
-        mu = x[:, :self.c_dim]
-        logvar = x[:, self.c_dim:]
-        return mu, logvar
-
-    def reparametrize(self, mu, logvar):
-        std = logvar.mul(0.5).exp_()
-        if cfg.CUDA:
-            eps = torch.cuda.FloatTensor(std.size()).normal_()
-        else:
-            eps = torch.FloatTensor(std.size()).normal_()
-        eps = Variable(eps)
-        return eps.mul(std).add_(mu)
-
-    def forward(self, text_embedding):
-        mu, logvar = self.encode(text_embedding)
-        c_code = self.reparametrize(mu, logvar)
-        return c_code, mu, logvar
-
-
 class INIT_STAGE_G(nn.Module):
     def __init__(self, ngf, ncf):
         super(INIT_STAGE_G, self).__init__()
         self.gf_dim = ngf
-        self.in_dim = cfg.GAN.Z_DIM + ncf  # cfg.TEXT.EMBEDDING_DIM
+        self.in_dim = ncf  # cfg.TEXT.EMBEDDING_DIM
 
         self.define_module()
 
@@ -319,15 +292,14 @@ class INIT_STAGE_G(nn.Module):
         self.upsample3 = upBlock(ngf // 4, ngf // 8)
         self.upsample4 = upBlock(ngf // 8, ngf // 16)
 
-    def forward(self, z_code, c_code):
+    def forward(self, c_code):
         """
         :param z_code: batch x cfg.GAN.Z_DIM
         :param c_code: batch x cfg.TEXT.EMBEDDING_DIM
         :return: batch x ngf/16 x 64 x 64
         """
-        c_z_code = torch.cat((c_code, z_code), 1)
         # state size ngf x 4 x 4
-        out_code = self.fc(c_z_code)
+        out_code = self.fc(c_code)
         out_code = out_code.view(-1, self.gf_dim, 4, 4)
         # state size ngf/3 x 8 x 8
         out_code = self.upsample1(out_code)
@@ -400,7 +372,7 @@ class G_NET(nn.Module):
         ngf = cfg.GAN.GF_DIM
         nef = cfg.TEXT.EMBEDDING_DIM
         ncf = cfg.GAN.CONDITION_DIM
-        self.ca_net = CA_NET()
+        self.zsl_g = ZSL_G(cfg.GAN.Z_DIM, nef, ncf)
 
         if cfg.TREE.BRANCH_NUM > 0:
             self.h_net1 = INIT_STAGE_G(ngf * 16, ncf)
@@ -413,7 +385,7 @@ class G_NET(nn.Module):
             self.h_net3 = NEXT_STAGE_G(ngf, nef, ncf)
             self.img_net3 = GET_IMAGE_G(ngf)
 
-    def forward(self, z_code, sent_emb, word_embs, mask):
+    def forward(self, sent_emb, word_embs, mask, z_code=None):
         """
             :param z_code: batch x cfg.GAN.Z_DIM
             :param sent_emb: batch x cfg.TEXT.EMBEDDING_DIM
@@ -423,29 +395,27 @@ class G_NET(nn.Module):
         """
         fake_imgs = []
         att_maps = []
-        c_code, mu, logvar = self.ca_net(sent_emb)
 
         if cfg.TREE.BRANCH_NUM > 0:
-            h_code1 = self.h_net1(z_code, c_code)
+            h_code1 = self.h_net1(sent_emb)
             fake_img1 = self.img_net1(h_code1)
             fake_imgs.append(fake_img1)
         if cfg.TREE.BRANCH_NUM > 1:
             h_code2, att1 = \
-                self.h_net2(h_code1, c_code, word_embs, mask)
+                self.h_net2(h_code1, sent_emb, word_embs, mask)
             fake_img2 = self.img_net2(h_code2)
             fake_imgs.append(fake_img2)
             if att1 is not None:
                 att_maps.append(att1)
         if cfg.TREE.BRANCH_NUM > 2:
             h_code3, att2 = \
-                self.h_net3(h_code2, c_code, word_embs, mask)
+                self.h_net3(h_code2, sent_emb, word_embs, mask)
             fake_img3 = self.img_net3(h_code3)
             fake_imgs.append(fake_img3)
             if att2 is not None:
                 att_maps.append(att2)
 
-        return fake_imgs, att_maps, mu, logvar
-
+        return fake_imgs, att_maps
 
 
 class G_DCGAN(nn.Module):
@@ -454,7 +424,6 @@ class G_DCGAN(nn.Module):
         ngf = cfg.GAN.GF_DIM
         nef = cfg.TEXT.EMBEDDING_DIM
         ncf = cfg.GAN.CONDITION_DIM
-        self.ca_net = CA_NET()
 
         # 16gf x 64 x 64 --> gf x 64 x 64 --> 3 x 64 x 64
         if cfg.TREE.BRANCH_NUM > 0:
@@ -466,7 +435,7 @@ class G_DCGAN(nn.Module):
             self.h_net3 = NEXT_STAGE_G(ngf, nef, ncf)
         self.img_net = GET_IMAGE_G(ngf)
 
-    def forward(self, z_code, sent_emb, word_embs, mask):
+    def forward(self, sent_emb, word_embs, mask):
         """
             :param z_code: batch x cfg.GAN.Z_DIM
             :param sent_emb: batch x cfg.TEXT.EMBEDDING_DIM
@@ -475,20 +444,19 @@ class G_DCGAN(nn.Module):
             :return:
         """
         att_maps = []
-        c_code, mu, logvar = self.ca_net(sent_emb)
         if cfg.TREE.BRANCH_NUM > 0:
-            h_code = self.h_net1(z_code, c_code)
+            h_code = self.h_net1(sent_emb)
         if cfg.TREE.BRANCH_NUM > 1:
-            h_code, att1 = self.h_net2(h_code, c_code, word_embs, mask)
+            h_code, att1 = self.h_net2(h_code, sent_emb, word_embs, mask)
             if att1 is not None:
                 att_maps.append(att1)
         if cfg.TREE.BRANCH_NUM > 2:
-            h_code, att2 = self.h_net3(h_code, c_code, word_embs, mask)
+            h_code, att2 = self.h_net3(h_code, sent_emb, word_embs, mask)
             if att2 is not None:
                 att_maps.append(att2)
 
         fake_imgs = self.img_net(h_code)
-        return [fake_imgs], att_maps, mu, logvar
+        return [fake_imgs], att_maps
 
 
 # ############## D networks ##########################
@@ -567,7 +535,7 @@ class D_NET64(nn.Module):
     def __init__(self, b_jcu=True):
         super(D_NET64, self).__init__()
         ndf = cfg.GAN.DF_DIM
-        nef = cfg.TEXT.EMBEDDING_DIM
+        nef = cfg.GAN.CONDITION_DIM
         self.img_code_s16 = encode_image_by_16times(ndf)
         if b_jcu:
             self.UNCOND_DNET = D_GET_LOGITS(ndf, nef, bcondition=False)
@@ -585,7 +553,7 @@ class D_NET128(nn.Module):
     def __init__(self, b_jcu=True):
         super(D_NET128, self).__init__()
         ndf = cfg.GAN.DF_DIM
-        nef = cfg.TEXT.EMBEDDING_DIM
+        nef = cfg.GAN.CONDITION_DIM
         self.img_code_s16 = encode_image_by_16times(ndf)
         self.img_code_s32 = downBlock(ndf * 8, ndf * 16)
         self.img_code_s32_1 = Block3x3_leakRelu(ndf * 16, ndf * 8)
@@ -608,7 +576,7 @@ class D_NET256(nn.Module):
     def __init__(self, b_jcu=True):
         super(D_NET256, self).__init__()
         ndf = cfg.GAN.DF_DIM
-        nef = cfg.TEXT.EMBEDDING_DIM
+        nef = cfg.GAN.CONDITION_DIM
         self.img_code_s16 = encode_image_by_16times(ndf)
         self.img_code_s32 = downBlock(ndf * 8, ndf * 16)
         self.img_code_s64 = downBlock(ndf * 16, ndf * 32)
@@ -627,3 +595,36 @@ class D_NET256(nn.Module):
         x_code4 = self.img_code_s64_1(x_code4)
         x_code4 = self.img_code_s64_2(x_code4)
         return x_code4
+
+
+# ############## Zero-shot discriminator ##########################
+class ZSL_D(nn.Module):
+    def __init__(self, classes, in_features):
+        super().__init__()
+        self.shared_layers = nn.Sequential(nn.Linear(in_features, 4096), nn.ReLU())
+        self.fake_head = nn.Sequential(nn.Linear(4096, 1))
+        self.class_head = nn.Sequential(nn.Linear(4096, classes))
+
+    def forward(self, x):
+        x = self.shared_layers(x)
+        return self.fake_head(x), self.class_head(x)
+
+
+class ZSL_G(nn.Module):
+    def __init__(self, z_size, in_size, out_size):
+        self.z_dim = z_size
+        self.in_dim = in_size
+        self.out_dim = out_size
+
+        self.input = nn.Linear(in_size, 1024)
+        self.output = nn.Sequential(
+            nn.Linear(1024 + self.z_dim, 1024),
+            nn.LeakyReLU(),
+            nn.Linear(1024, out_size),
+            nn.Tanh())
+
+    def forward(self, x, z=None):
+        x = self.input(x)
+        if z is None:
+            z = torch.randn((x.size(0), self.z_dim), device=x.device, dtype=torch.float)
+        return self.output(torch.cat((x, z), dim=-1))

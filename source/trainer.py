@@ -14,7 +14,7 @@ from miscc.utils import build_super_images, build_super_images2
 from miscc.utils import weights_init, load_params, copy_G_params
 from source.model import G_DCGAN, G_NET
 from source.datasets import prepare_data
-from source.model import RNN_ENCODER, CNN_ENCODER
+from source.model import RNN_ENCODER, CNN_ENCODER, ZSL_D
 
 from miscc.losses import words_loss
 from miscc.losses import discriminator_loss, generator_loss, KL_loss
@@ -52,24 +52,29 @@ class condGANTrainer(object):
 
         image_encoder = CNN_ENCODER(cfg.TEXT.EMBEDDING_DIM)
         img_encoder_path = cfg.TRAIN.NET_E.replace('text_encoder', 'image_encoder')
-        state_dict = \
-            torch.load(img_encoder_path, map_location=lambda storage, loc: storage)
+        state_dict = torch.load(img_encoder_path, map_location=lambda storage, loc: storage)
         image_encoder.load_state_dict(state_dict)
         for p in image_encoder.parameters():
             p.requires_grad = False
         print('Load image encoder from:', img_encoder_path)
         image_encoder.eval()
 
-        text_encoder = \
-            RNN_ENCODER(self.n_words, nhidden=cfg.TEXT.EMBEDDING_DIM)
-        state_dict = \
-            torch.load(cfg.TRAIN.NET_E,
-                       map_location=lambda storage, loc: storage)
+        text_encoder = RNN_ENCODER(self.n_words, nhidden=cfg.TEXT.EMBEDDING_DIM)
+        state_dict = torch.load(cfg.TRAIN.NET_E, map_location=lambda storage, loc: storage)
         text_encoder.load_state_dict(state_dict)
         for p in text_encoder.parameters():
             p.requires_grad = False
         print('Load text encoder from:', cfg.TRAIN.NET_E)
         text_encoder.eval()
+
+        features_discriminator_path = cfg.TRAIN.NET_E.replace('text_encoder', 'discriminator')
+        features_discriminator = ZSL_D(cfg.NUM_CLASSES, cfg.GAN.CONDITION_DIM)
+        state_dict = torch.load(features_discriminator_path, map_location=lambda storage, loc: storage)
+        features_discriminator.load_state_dict(state_dict)
+        for p in features_discriminator.parameters():
+            p.requires_grad = False
+        print('Load features discriminator from:', features_discriminator_path)
+        features_discriminator.eval()
 
         # #######################generator and discriminators############## #
         netsD = []
@@ -124,7 +129,7 @@ class condGANTrainer(object):
             netG.cuda()
             for i in range(len(netsD)):
                 netsD[i].cuda()
-        return [text_encoder, image_encoder, netG, netsD, epoch]
+        return [text_encoder, image_encoder, features_discriminator, netG, netsD, epoch]
 
     def define_optimizers(self, netG, netsD):
         optimizersD = []
@@ -213,17 +218,16 @@ class condGANTrainer(object):
             im.save(fullpath)
 
     def train(self):
-        text_encoder, image_encoder, netG, netsD, start_epoch = self.build_models()
+        text_encoder, image_encoder, features_discriminator, netG, netsD, start_epoch = self.build_models()
         avg_param_G = copy_G_params(netG)
         optimizerG, optimizersD = self.define_optimizers(netG, netsD)
         real_labels, fake_labels, match_labels = self.prepare_labels()
 
         batch_size = self.batch_size
         nz = cfg.GAN.Z_DIM
-        noise = Variable(torch.FloatTensor(batch_size, nz))
-        fixed_noise = Variable(torch.FloatTensor(batch_size, nz).normal_(0, 1))
+        fixed_noise = torch.FloatTensor(batch_size, nz).normal_(0, 1)
         if cfg.CUDA:
-            noise, fixed_noise = noise.cuda(), fixed_noise.cuda()
+            fixed_noise = fixed_noise.cuda()
 
         gen_iterations = 0
         # gen_iterations = start_epoch * self.num_batches
@@ -246,7 +250,7 @@ class condGANTrainer(object):
                 # words_embs: batch_size x nef x seq_len
                 # sent_emb: batch_size x nef
                 words_embs, sent_emb = text_encoder(captions, cap_lens, hidden)
-                words_embs, sent_emb = words_embs.detach(), sent_emb.detach()
+                words_embs, sent_emb = words_embs.detach(), sent_emb.detach()  # TODO: Why detach?
                 mask = (captions == 0)
                 num_words = words_embs.size(2)
                 if mask.size(1) > num_words:
@@ -255,8 +259,7 @@ class condGANTrainer(object):
                 #######################################################
                 # (2) Generate fake images
                 ######################################################
-                noise.data.normal_(0, 1)
-                fake_imgs, _, mu, logvar = netG(noise, sent_emb, words_embs, mask)
+                fake_imgs, _ = netG(sent_emb, words_embs, mask)
 
                 #######################################################
                 # (3) Update D network
@@ -284,11 +287,8 @@ class condGANTrainer(object):
                 # self.set_requires_grad_value(netsD, False)
                 netG.zero_grad()
                 errG_total, G_logs = \
-                    generator_loss(netsD, image_encoder, fake_imgs, real_labels,
+                    generator_loss(netsD, image_encoder, features_discriminator, fake_imgs, real_labels,
                                    words_embs, sent_emb, match_labels, cap_lens, class_ids)
-                kl_loss = KL_loss(mu, logvar)
-                errG_total += kl_loss
-                G_logs += 'kl_loss: %.2f ' % kl_loss.data[0]
                 # backward and update parameters
                 errG_total.backward()
                 optimizerG.step()
