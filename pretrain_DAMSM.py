@@ -5,10 +5,10 @@ from miscc.utils import build_super_images
 from miscc.losses import sent_loss, words_loss
 from miscc.config import cfg, cfg_from_file
 
-from datasets import TextDataset
-from datasets import prepare_data
+from source.datasets import TextDataset
+from source.datasets import prepare_data
 
-from model import RNN_ENCODER, CNN_ENCODER
+from source.model import RNN_ENCODER, CNN_ENCODER
 
 import os
 import sys
@@ -22,7 +22,6 @@ import numpy as np
 from PIL import Image
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
