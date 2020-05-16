@@ -27,4 +27,3 @@ In such setup new model may possibly benefit from joint training instead of two-
 
 ### Important TODO's
 1. Implement more logging. There are no logging at all. Only console output and images that saved every few batches.
-2. Optimize code. Main model training process have very low performance. Most of the time for consuming one batch loosed on CPU operations while GPU stand idle. 
