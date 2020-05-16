@@ -15,7 +15,7 @@ TREE:
 TRAIN:
     FLAG: True
     NET_E: 'output/birds_DAMSM_2020_05_16_04_46_53/Model/text_encoder105.pth'
-    BATCH_SIZE: 16
+    BATCH_SIZE: 8
     MAX_EPOCH: 100
     SNAPSHOT_INTERVAL: 5
     ENCODER_LR: 0.001  # 0.0002best; 0.002good; scott: 0.0007 with 0.98decay
