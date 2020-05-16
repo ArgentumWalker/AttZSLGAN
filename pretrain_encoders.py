@@ -8,7 +8,7 @@ from miscc.config import cfg, cfg_from_file
 from source.datasets import TextDataset
 from source.datasets import prepare_data
 
-from source.model import RNN_ENCODER, CNN_ENCODER
+from source.model import RNN_ENCODER, CNN_ENCODER, ZSL_D
 
 import os
 import sys
@@ -65,6 +65,9 @@ def train(dataloader, cnn_model, rnn_model, d_model, batch_size,
 
         imgs, captions, cap_lens, class_ids, keys = prepare_data(data)
 
+        target_classes = torch.LongTensor(class_ids)
+        if cfg.CUDA:
+            target_classes = target_classes.cuda()
         # words_features: batch_size x nef x 17 x 17
         # sent_code: batch_size x nef
         words_features, sent_code = cnn_model(imgs[-1])
@@ -78,22 +81,18 @@ def train(dataloader, cnn_model, rnn_model, d_model, batch_size,
         words_emb, sent_emb = rnn_model(captions, cap_lens, hidden)
 
         w_loss0, w_loss1, attn_maps = words_loss(words_features, words_emb, labels, cap_lens, class_ids, batch_size)
-        w_total_loss0 += w_loss0.data
-        w_total_loss1 += w_loss1.data
         loss = w_loss0 + w_loss1
 
         s_loss0, s_loss1 = sent_loss(sent_code, sent_emb, labels, class_ids, batch_size)
         loss += s_loss0 + s_loss1
-        s_total_loss0 += s_loss0.data
-        s_total_loss1 += s_loss1.data
 
         is_fake_0, pred_class_0 = d_model(sent_code)
         is_fake_1, pred_class_1 = d_model(sent_emb)
-        g_loss = (is_fake_0.mean() + is_fake_1.mean()
-                 + F.cross_entropy(pred_class_0, class_ids)
-                 + F.cross_entropy(pred_class_1, class_ids))
-        loss += g_loss
-        g_total_loss += g_loss.data
+        g_loss = (F.binary_cross_entropy_with_logits(is_fake_0, torch.zeros_like(is_fake_0))
+                 + F.binary_cross_entropy_with_logits(is_fake_1, torch.zeros_like(is_fake_1))
+                 + F.cross_entropy(pred_class_0, target_classes)
+                 + F.cross_entropy(pred_class_1, target_classes))
+        loss += g_loss * cfg.TRAIN.SMOOTH.SUPERVISED_COEF
 
         loss.backward()
         #
@@ -101,6 +100,11 @@ def train(dataloader, cnn_model, rnn_model, d_model, batch_size,
         # the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm(rnn_model.parameters(),
                                       cfg.TRAIN.RNN_GRAD_CLIP)
+        s_total_loss0 += s_loss0.item()
+        s_total_loss1 += s_loss1.item()
+        w_total_loss0 += w_loss0.item()
+        w_total_loss1 += w_loss1.item()
+        g_total_loss += g_loss.item()
         generator_optimizer.step()
         d_model.zero_grad()
 
@@ -110,25 +114,27 @@ def train(dataloader, cnn_model, rnn_model, d_model, batch_size,
 
         is_fake_0, pred_class_0 = d_model(sent_code)
         is_fake_1, pred_class_1 = d_model(sent_emb)
-        d_loss = (is_fake_0.mean() - is_fake_1.mean()
-                + F.cross_entropy(pred_class_0, class_ids)
-                + F.cross_entropy(pred_class_1, class_ids))
+
+        d_loss = (F.binary_cross_entropy_with_logits(is_fake_0, torch.zeros_like(is_fake_0))
+                + F.binary_cross_entropy_with_logits(is_fake_1, torch.ones_like(is_fake_1))
+                + F.cross_entropy(pred_class_0, target_classes)
+                + F.cross_entropy(pred_class_1, target_classes))
         loss = d_loss
         loss.backward()
         discriminator_optimizer.step()
-        d_total_loss += d_loss.data
+        d_total_loss += d_loss.item()
 
         if step % UPDATE_INTERVAL == 0:
             count = epoch * len(dataloader) + step
 
-            s_cur_loss0 = s_total_loss0[0] / UPDATE_INTERVAL
-            s_cur_loss1 = s_total_loss1[0] / UPDATE_INTERVAL
+            s_cur_loss0 = s_total_loss0 / UPDATE_INTERVAL
+            s_cur_loss1 = s_total_loss1 / UPDATE_INTERVAL
 
-            w_cur_loss0 = w_total_loss0[0] / UPDATE_INTERVAL
-            w_cur_loss1 = w_total_loss1[0] / UPDATE_INTERVAL
+            w_cur_loss0 = w_total_loss0 / UPDATE_INTERVAL
+            w_cur_loss1 = w_total_loss1 / UPDATE_INTERVAL
 
-            d_cur_loss = d_cur_loss[0] / UPDATE_INTERVAL
-            g_cur_loss = g_cur_loss[0] / UPDATE_INTERVAL
+            d_cur_loss = d_total_loss / UPDATE_INTERVAL
+            g_cur_loss = g_total_loss / UPDATE_INTERVAL
 
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | '
@@ -183,8 +189,8 @@ def evaluate(dataloader, cnn_model, rnn_model, batch_size):
         if step == 50:
             break
 
-    s_cur_loss = s_total_loss[0] / step
-    w_cur_loss = w_total_loss[0] / step
+    s_cur_loss = s_total_loss / step
+    w_cur_loss = w_total_loss / step
 
     return s_cur_loss, w_cur_loss
 
@@ -192,7 +198,8 @@ def evaluate(dataloader, cnn_model, rnn_model, batch_size):
 def build_models():
     # build model ############################################################
     text_encoder = RNN_ENCODER(dataset.n_words, nhidden=cfg.TEXT.EMBEDDING_DIM)
-    image_encoder = CNN_ENCODER(cfg.TEXT.EMBEDDING_DIM)
+    image_encoder = CNN_ENCODER(cfg.GAN.CONDITION_DIM)
+    discriminator = ZSL_D(cfg.NUM_CLASSES, cfg.GAN.CONDITION_DIM)
     labels = Variable(torch.LongTensor(range(batch_size)))
     start_epoch = 0
     if cfg.TRAIN.NET_E != '':
@@ -205,6 +212,11 @@ def build_models():
         image_encoder.load_state_dict(state_dict)
         print('Load ', name)
 
+        name = cfg.TRAIN.NET_E.replace('text_encoder', 'discriminator')
+        state_dict = torch.load(name)
+        discriminator.load_state_dict(state_dict)
+        print('Load ', name)
+
         istart = cfg.TRAIN.NET_E.rfind('_') + 8
         iend = cfg.TRAIN.NET_E.rfind('.')
         start_epoch = cfg.TRAIN.NET_E[istart:iend]
@@ -213,9 +225,10 @@ def build_models():
     if cfg.CUDA:
         text_encoder = text_encoder.cuda()
         image_encoder = image_encoder.cuda()
+        discriminator = discriminator.cuda()
         labels = labels.cuda()
 
-    return text_encoder, image_encoder, labels, start_epoch
+    return text_encoder, image_encoder, discriminator, labels, start_epoch
 
 
 if __name__ == "__main__":
@@ -246,7 +259,7 @@ if __name__ == "__main__":
     ##########################################################################
     now = datetime.datetime.now(dateutil.tz.tzlocal())
     timestamp = now.strftime('%Y_%m_%d_%H_%M_%S')
-    output_dir = '../output/%s_%s_%s' % \
+    output_dir = 'output/%s_%s_%s' % \
         (cfg.DATASET_NAME, cfg.CONFIG_NAME, timestamp)
 
     model_dir = os.path.join(output_dir, 'Model')
@@ -292,11 +305,12 @@ if __name__ == "__main__":
     # At any point you can hit Ctrl + C to break out of training early.
     try:
         lr = cfg.TRAIN.ENCODER_LR
+        gen_optimizer = optim.Adam(para, lr=lr, betas=(0.5, 0.999))
+        d_optimizer = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
         for epoch in range(start_epoch, cfg.TRAIN.MAX_EPOCH):
-            optimizer = optim.Adam(para, lr=lr, betas=(0.5, 0.999))
             epoch_start_time = time.time()
             count = train(dataloader, image_encoder, text_encoder, discriminator,
-                          batch_size, labels, optimizer, epoch,
+                          batch_size, labels, gen_optimizer, d_optimizer, epoch,
                           dataset.ixtoword, image_dir)
             print('-' * 89)
             if len(dataloader_val) > 0:

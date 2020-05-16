@@ -206,7 +206,7 @@ class CNN_ENCODER(nn.Module):
     def init_trainable_weights(self):
         initrange = 0.1
         self.emb_features.weight.data.uniform_(-initrange, initrange)
-        self.emb_cnn_code.weight.data.uniform_(-initrange, initrange)
+        self.emb_cnn_code[0].weight.data.uniform_(-initrange, initrange)
 
     def forward(self, x):
         features = None
@@ -372,7 +372,6 @@ class G_NET(nn.Module):
         ngf = cfg.GAN.GF_DIM
         nef = cfg.TEXT.EMBEDDING_DIM
         ncf = cfg.GAN.CONDITION_DIM
-        self.zsl_g = ZSL_G(cfg.GAN.Z_DIM, nef, ncf)
 
         if cfg.TREE.BRANCH_NUM > 0:
             self.h_net1 = INIT_STAGE_G(ngf * 16, ncf)
@@ -612,6 +611,7 @@ class ZSL_D(nn.Module):
 
 class ZSL_G(nn.Module):
     def __init__(self, z_size, in_size, out_size):
+        super().__init__()
         self.z_dim = z_size
         self.in_dim = in_size
         self.out_dim = out_size

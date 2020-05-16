@@ -182,7 +182,7 @@ def generator_loss(netsD, image_encoder, features_discriminator, fake_imgs, real
             g_loss = cond_errG
         errG_total += g_loss
         # err_img = errG_total.data[0]
-        logs += 'g_loss%d: %.2f ' % (i, g_loss.data[0])
+        logs += 'g_loss%d: %.2f ' % (i, g_loss.item())
 
         # Ranking loss
         if i == (numDs - 1):
@@ -201,10 +201,11 @@ def generator_loss(netsD, image_encoder, features_discriminator, fake_imgs, real
             # err_sent = err_sent + s_loss.data[0]
 
             is_fake, pred_class = features_discriminator(cnn_code)
-            d_loss = (-is_fake.mean() + F.cross_entropy(pred_class, class_ids)) * cfg.TRAIN.SMOOTH.LAMBDA
+            d_loss = (F.binary_cross_entropy_with_logits(is_fake, torch.zeros_like(is_fake))
+                      + F.cross_entropy(pred_class, torch.LongTensor(class_ids).to(pred_class.device))) * cfg.TRAIN.SMOOTH.SUPERVISED_COEF
 
             errG_total += w_loss + s_loss + d_loss
-            logs += 'w_loss: %.2f s_loss: %.2f ' % (w_loss.data[0], s_loss.data[0])
+            logs += 'w_loss: %.2f s_loss: %.2f ' % (w_loss.item(), s_loss.item())
     return errG_total, logs
 
 

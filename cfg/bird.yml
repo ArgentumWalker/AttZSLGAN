@@ -1,23 +1,23 @@
 CONFIG_NAME: 'DAMSM'
 
 DATASET_NAME: 'birds'
-DATA_DIR: '../data/birds'
+DATA_DIR: 'data/birds'
 GPU_ID: 0
-WORKERS: 3
+WORKERS: 4
 NUM_CLASSES: 200
 
 
 TREE:
-    BRANCH_NUM: 2
-    BASE_SIZE: 299
+    BRANCH_NUM: 3
+    BASE_SIZE: 64
 
 
 TRAIN:
     FLAG: True
-    NET_E: ''  # '../DAMSMencoders/bird/text_encoder200.pth'
-    BATCH_SIZE: 32
+    NET_E: 'output/birds_DAMSM_2020_05_16_04_46_53/Model/text_encoder105.pth'
+    BATCH_SIZE: 16
     MAX_EPOCH: 100
-    SNAPSHOT_INTERVAL: 10
+    SNAPSHOT_INTERVAL: 5
     ENCODER_LR: 0.001  # 0.0002best; 0.002good; scott: 0.0007 with 0.98decay
     RNN_GRAD_CLIP: 0.25
 
@@ -29,6 +29,7 @@ TRAIN:
         GAMMA2: 5.0
         GAMMA3: 10.0  # 10good 1&100bad
         LAMBDA: 1.0
+        SUPERVISED_COEF: 0.1
 
 
 GAN:

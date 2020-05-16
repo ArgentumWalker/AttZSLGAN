@@ -21,6 +21,7 @@ from miscc.losses import discriminator_loss, generator_loss, KL_loss
 import os
 import time
 import numpy as np
+from tqdm import tqdm
 
 
 # ################# Text to image task############################ #
@@ -50,7 +51,7 @@ class condGANTrainer(object):
             print('Error: no pretrained text-image encoders')
             return
 
-        image_encoder = CNN_ENCODER(cfg.TEXT.EMBEDDING_DIM)
+        image_encoder = CNN_ENCODER(cfg.GAN.CONDITION_DIM)
         img_encoder_path = cfg.TRAIN.NET_E.replace('text_encoder', 'image_encoder')
         state_dict = torch.load(img_encoder_path, map_location=lambda storage, loc: storage)
         image_encoder.load_state_dict(state_dict)
@@ -80,15 +81,15 @@ class condGANTrainer(object):
         netsD = []
         if cfg.GAN.B_DCGAN:
             if cfg.TREE.BRANCH_NUM ==1:
-                from code.model import D_NET64 as D_NET
+                from source.model import D_NET64 as D_NET
             elif cfg.TREE.BRANCH_NUM == 2:
-                from code.model import D_NET128 as D_NET
+                from source.model import D_NET128 as D_NET
             else:  # cfg.TREE.BRANCH_NUM == 3:
-                from code.model import D_NET256 as D_NET
+                from source.model import D_NET256 as D_NET
             netG = G_DCGAN()
             netsD = [D_NET(b_jcu=False)]
         else:
-            from code.model import D_NET64, D_NET128, D_NET256
+            from source.model import D_NET64, D_NET128, D_NET256
             netG = G_NET()
             if cfg.TREE.BRANCH_NUM > 0:
                 netsD.append(D_NET64())
@@ -176,11 +177,11 @@ class condGANTrainer(object):
             for p in models_list[i].parameters():
                 p.requires_grad = brequires
 
-    def save_img_results(self, netG, noise, sent_emb, words_embs, mask,
+    def save_img_results(self, netG, sent_emb, words_embs, mask,
                          image_encoder, captions, cap_lens,
                          gen_iterations, name='current'):
         # Save images
-        fake_imgs, attention_maps, _, _ = netG(noise, sent_emb, words_embs, mask)
+        fake_imgs, attention_maps = netG(sent_emb, words_embs, mask)
         for i in range(len(attention_maps)):
             if len(fake_imgs) > 1:
                 img = fake_imgs[i + 1].detach().cpu()
@@ -225,9 +226,6 @@ class condGANTrainer(object):
 
         batch_size = self.batch_size
         nz = cfg.GAN.Z_DIM
-        fixed_noise = torch.FloatTensor(batch_size, nz).normal_(0, 1)
-        if cfg.CUDA:
-            fixed_noise = fixed_noise.cuda()
 
         gen_iterations = 0
         # gen_iterations = start_epoch * self.num_batches
@@ -235,8 +233,7 @@ class condGANTrainer(object):
             start_t = time.time()
 
             data_iter = iter(self.data_loader)
-            step = 0
-            while step < self.num_batches:
+            for step in tqdm(range(self.num_batches)):
                 # reset requires_grad to be trainable for all Ds
                 # self.set_requires_grad_value(netsD, True)
 
@@ -274,13 +271,12 @@ class condGANTrainer(object):
                     errD.backward()
                     optimizersD[i].step()
                     errD_total += errD
-                    D_logs += 'errD%d: %.2f ' % (i, errD.data[0])
+                    D_logs += 'errD%d: %.2f ' % (i, errD.item())
 
                 #######################################################
                 # (4) Update G network: maximize log(D(G(z)))
                 ######################################################
                 # compute total loss for training G
-                step += 1
                 gen_iterations += 1
 
                 # do not need to compute gradient for Ds
@@ -295,13 +291,13 @@ class condGANTrainer(object):
                 for p, avg_p in zip(netG.parameters(), avg_param_G):
                     avg_p.mul_(0.999).add_(0.001, p.data)
 
-                if gen_iterations % 100 == 0:
+                if gen_iterations % 100 == 1:
                     print(D_logs + '\n' + G_logs)
                 # save images
-                if gen_iterations % 1000 == 0:
+                if gen_iterations % 1000 == 1:
                     backup_para = copy_G_params(netG)
                     load_params(netG, avg_param_G)
-                    self.save_img_results(netG, fixed_noise, sent_emb,
+                    self.save_img_results(netG, sent_emb,
                                           words_embs, mask, image_encoder,
                                           captions, cap_lens, epoch, name='average')
                     load_params(netG, backup_para)

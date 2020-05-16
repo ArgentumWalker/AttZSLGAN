@@ -16,6 +16,7 @@ __C.DATA_DIR = ''
 __C.GPU_ID = 0
 __C.CUDA = True
 __C.WORKERS = 6
+__C.NUM_CLASSES = 2
 
 __C.RNN_TYPE = 'LSTM'   # 'GRU'
 __C.B_VALIDATION = False
@@ -44,6 +45,7 @@ __C.TRAIN.SMOOTH.GAMMA1 = 5.0
 __C.TRAIN.SMOOTH.GAMMA3 = 10.0
 __C.TRAIN.SMOOTH.GAMMA2 = 5.0
 __C.TRAIN.SMOOTH.LAMBDA = 1.0
+__C.TRAIN.SMOOTH.SUPERVISED_COEF = .1
 
 
 # Modal options
@@ -51,7 +53,7 @@ __C.GAN = edict()
 __C.GAN.DF_DIM = 64
 __C.GAN.GF_DIM = 128
 __C.GAN.Z_DIM = 100
-__C.GAN.CONDITION_DIM = 100
+__C.GAN.CONDITION_DIM = 256
 __C.GAN.R_NUM = 2
 __C.GAN.B_ATTENTION = True
 __C.GAN.B_DCGAN = False
@@ -70,9 +72,9 @@ def _merge_a_into_b(a, b):
     if type(a) is not edict:
         return
 
-    for k, v in a.iteritems():
+    for k, v in a.items():
         # a must specify keys that are in b
-        if not b.has_key(k):
+        if not k in b.keys():
             raise KeyError('{} is not a valid config key'.format(k))
 
         # the types must match, too
