@@ -25,5 +25,11 @@ For AttnGAN generator training I also added ZSL-GAN generator loss as an additiv
 
 In such setup new model may possibly benefit from joint training instead of two-step training. Also it may benefit from removing sentence term from DAMSM loss as it forces sentence embedding be more deterministic.
 
+### Results
+[(Poorly) Pretrained models](https://yadi.sk/d/bvngJhLBnANYuw)
+
+Generator output after 5 epoch:
+![](https://github.com/ArgentumWalker/ZSL-AttnGAN/blob/master/D_average_6.png)
+
 ### Important TODO's
 1. Implement more logging. There are no logging at all. Only console output and images that saved every few batches.
